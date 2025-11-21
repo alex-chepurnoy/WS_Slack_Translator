@@ -1,7 +1,8 @@
 services:
   wowza-webhook-to-slack:
     build: .
-    image: wowza-webhook-to-slack:latest
+    # Local build plus explicit Docker Hub image tag for consistency
+    image: achepw0wz/wowza-webhook-to-slack:latest
     container_name: wowza-webhook-to-slack
     ports:
       - "${PORT:-8080}:8080"

@@ -3,10 +3,8 @@
 
 services:
   wowza-webhook-to-slack:
-    # Override image tag for production
-    image: wowza-webhook-to-slack:prod
-    # Use pre-built image from registry (if you publish to Docker Hub)
-    # image: alex-chepurnoy/wowza-webhook-to-slack:latest
+    # Use published production image from Docker Hub
+    image: achepw0wz/wowza-webhook-to-slack:prod
     
     # Production logging level
     environment:
