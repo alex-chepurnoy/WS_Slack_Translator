@@ -22,3 +22,11 @@ Thumbs.db
 
 # Local config
 config.json
+
+# Docker environment file (contains secrets)
+.env
+
+# Virtual environment
+venv/
+env/
+ENV/

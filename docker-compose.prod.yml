@@ -1,0 +1,31 @@
+# Docker Compose override file for production deployment
+# Use with: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+version: '3.8'
+
+services:
+  wowza-webhook-to-slack:
+    # Use pre-built image from registry (if you publish to Docker Hub)
+    # image: your-dockerhub-username/wowza-webhook-to-slack:latest
+    
+    # Production logging level
+    environment:
+      - LOG_LEVEL=WARNING
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+    
+    # Always restart on failure
+    restart: always
+    
+    # Add labels for monitoring/organization
+    labels:
+      - "com.example.service=wowza-webhook-to-slack"
+      - "com.example.environment=production"

@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  wowza-webhook-to-slack:
+    build: .
+    container_name: wowza-webhook-to-slack
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      # Required: Your Slack Webhook URL
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      # Optional: Logging level (DEBUG, INFO, WARNING, ERROR)
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Optional: Port to run on inside container (default 8080)
+      - PORT=8080
+      # Log directory
+      - LOG_DIR=/app/logs
+    volumes:
+      # Mount logs directory to persist logs
+      - ./logs:/app/logs
+      # Optional: Mount config.json if you prefer file-based config
+      - ./config.json:/app/config.json:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

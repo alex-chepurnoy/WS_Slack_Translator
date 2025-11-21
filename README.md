@@ -9,8 +9,36 @@ Relevant docs
 -------------
 - Wowza webhooks and supported events: https://www.wowza.com/docs/create-webhooks-to-monitor-streaming-events-in-wowza-streaming-engine
 
-Install and run (Windows)
---------------------------
+## Deployment Options
+
+Choose one of the following deployment methods:
+
+### Option 1: Docker (Recommended for Production)
+
+The easiest way to deploy this application is using Docker. See **[DOCKER_README.md](DOCKER_README.md)** for complete instructions.
+
+**Quick Start:**
+```bash
+# Copy environment template
+cp .env.example .env
+
+# Edit .env with your Slack webhook URL
+nano .env  # or notepad .env on Windows
+
+# Start with Docker Compose
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+```
+
+Or use the quick start scripts:
+- Linux/Mac: `./docker-quickstart.sh`
+- Windows: `.\docker-quickstart.ps1`
+
+### Option 2: Windows Native Install
+### Option 2: Windows Native Install
+
 Recommended: use the provided installer script which automates Python, dependencies, and service registration.
 
 1. Download the project from GitHub (clone or Download ZIP) and extract.
@@ -34,8 +62,7 @@ Notes for Windows
 Manual Windows (only for development/testing)
 - If you don't want to use the installer, install Python, create `config.json` or set `SLACK_WEBHOOK_URL`, and run `python http_server.py` from the project folder. This is intended for testing, not production.
 
-Install and run (Linux)
-------------------------
+### Option 3: Linux Native Install
 This section describes a straightforward manual setup using a virtualenv and a systemd service. You can adapt these steps to your distro and preferred user account.
 
 1. Clone the repo on the target machine and create a virtualenv:

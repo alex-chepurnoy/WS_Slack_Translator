@@ -7,9 +7,16 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 # Configure logging to log to both a file and the console
-LOG_FILE = "server.log"
+LOG_DIR = Path(os.environ.get('LOG_DIR', 'logs'))
+LOG_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIR / "server.log"
+
+# Get log level from environment variable
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+log_level = getattr(logging, LOG_LEVEL, logging.INFO)
+
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=log_level,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE, mode='a'),  # Log to a file in append mode
@@ -214,6 +221,14 @@ def wowza_webhook():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """
+    Health check endpoint for Docker health checks and monitoring.
+    """
+    return jsonify({"status": "healthy", "service": "wowza-webhook-to-slack"}), 200
+
+
 def format_timestamp(raw_ts):
     """Format the raw timestamp into a human-readable string in the server's local timezone.
 
@@ -307,6 +322,8 @@ def send_to_slack(message):
         logging.error("An exception occurred while sending to Slack: %s", e, exc_info=True)
 
 if __name__ == '__main__':
+    # Get port from environment variable or default to 8080
+    port = int(os.environ.get('PORT', 8080))
     # Run the Flask app
-    logging.info("Starting Flask app on port 8080.")
-    app.run(host='0.0.0.0', port=8080)
+    logging.info("Starting Flask app on port %s.", port)
+    app.run(host='0.0.0.0', port=port)
