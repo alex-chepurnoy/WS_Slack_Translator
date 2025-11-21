@@ -1,12 +1,12 @@
 # Docker Compose override file for production deployment
 # Use with: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 
-version: '3.8'
-
 services:
   wowza-webhook-to-slack:
+    # Override image tag for production
+    image: wowza-webhook-to-slack:prod
     # Use pre-built image from registry (if you publish to Docker Hub)
-    # image: your-dockerhub-username/wowza-webhook-to-slack:latest
+    # image: alex-chepurnoy/wowza-webhook-to-slack:latest
     
     # Production logging level
     environment:
