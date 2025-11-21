@@ -37,7 +37,6 @@ Or use the quick start scripts:
 - Windows: `.\docker-quickstart.ps1`
 
 ### Option 2: Windows Native Install
-### Option 2: Windows Native Install
 
 Recommended: use the provided installer script which automates Python, dependencies, and service registration.
 
