@@ -28,45 +28,74 @@ Expected response: `{"status":"ok"}` (HTTP 200).
 - Different host: use `http://<translator_host_ip_or_dns>:8080/webhook` and ensure firewall access.
 - Behind reverse proxy: map external URL to internal `:8080` and use that external URL.
 
-### 3. Add Webhook via Wowza Manager (GUI)
-1. Log in to Wowza Streaming Engine Manager.
-2. Navigate: Server > Webhooks (or Events/Webhooks section depending on version).
-3. Click "Add Webhook".
-4. Set Name: `SlackTranslator` (any descriptive name).
-5. URL: `http://localhost:8080/webhook` (adjust based on step 2).
-6. Method: `POST`.
-7. Select events you want (e.g. stream start/stop, recording start/stop, transcoder start/stop). The translator will ignore fields it does not understand and log them.
-8. Enable the webhook and Save.
+### 3. Configure Server.xml
+Edit your Wowza Streaming Engine Server.xml file to load the WebhookListener module:
 
-### 4. Add Webhook via REST API (Alternative)
-Wowza's REST API usually listens on port `8088`. Replace credentials and events to match your setup.
-```bash
-curl -u admin:yourPassword \
-	-H 'Content-Type: application/json' \
-	-X POST \
-	http://localhost:8088/api/v1/webhooks \
-	-d '{
-		"name": "SlackTranslator",
-		"url": "http://localhost:8080/webhook",
-		"enabled": true,
-		"events": ["streamStart","streamStop","recordingStart","recordingStop","transcoderStart","transcoderStop","publish","unpublish"]
-	}'
+1. Open `[wowza-install-dir]/conf/Server.xml` in a text editor.
+2. Inside the `<ServerListeners>` element, add as the first entry:
+```xml
+<ServerListener>
+  <BaseClass>com.wowza.wms.webhooks.WebhookListener</BaseClass>
+</ServerListener>
 ```
-Event identifiers vary by Wowza version; consult the official docs for the definitive list.
+3. Save the file and restart Wowza Streaming Engine.
+
+### 4. Configure Webhooks.json
+Edit the Webhooks.json file to define webhook targets and filters:
+
+1. Open `[wowza-install-dir]/conf/Webhooks.json` in a text editor.
+2. Configure your webhook target. Example configuration:
+```json
+{
+  "webhooks": {
+    "source": "myWSEInstanceName",
+    "filters": [
+      {
+        "id": "slackTranslatorFilter",
+        "enabled": true,
+        "criteria": "vHost._defaultVHost_.>",
+        "targetRef": "slackTranslator"
+      }
+    ],
+    "targets": [
+      {
+        "id": "slackTranslator",
+        "url": "http://localhost:8080/webhook",
+        "headers": []
+      }
+    ]
+  }
+}
+```
+
+**Key configuration notes:**
+- `criteria`: Filter pattern for events. Use `vHost._defaultVHost_.>` to capture all events from the default virtual host, or customize for specific apps/streams (e.g., `vHost.*.app.live.appInstance.*.stream.*.state.*`).
+- `url`: Your translator webhook endpoint (adjust based on step 2).
+- `headers`: Optional HTTP headers if authentication is needed.
+- For JWT authentication or advanced filtering, see the [Webhooks.json configuration reference](https://www.wowza.com/docs/wowza-streaming-engine-webhooksjson-configuration-reference).
+
+3. Save the file and restart Wowza Streaming Engine.
 
 ### 5. Test With a Manual POST
-You can simulate Wowza by sending a minimal payload:
+You can simulate Wowza by sending a test payload to verify the translator is working:
 ```bash
 curl -X POST http://localhost:8080/webhook \
 	-H 'Content-Type: application/json' \
 	-d '{
-		"event": "streamStart",
-		"appName": "live",
-		"streamName": "demoStream",
-		"timestamp": 1732212345678
+		"name": "stream.started",
+		"timestamp": 1732212345678,
+		"context": {
+			"app": "live",
+			"stream": "demoStream",
+			"state": "started",
+			"vhost": "_defaultVHost_",
+			"appInstance": "_definst_"
+		},
+		"source": "TestWSE",
+		"version": "1.0"
 	}'
 ```
-Check your Slack channel for a formatted message. If nothing appears, inspect container logs and confirm `SLACK_WEBHOOK_URL` is set.
+Check your Slack channel for a formatted message. If nothing appears, inspect container logs with `docker-compose logs -f` and confirm `SLACK_WEBHOOK_URL` is set.
 
 ### 6. Common Integration Notes
 - If Wowza runs as a Windows service and translator runs in Docker on the same Windows host, `localhost` works.
@@ -74,20 +103,46 @@ Check your Slack channel for a formatted message. If nothing appears, inspect co
 - For high-volume environments, consider rate limiting or batching on the Slack side (this translator sends per-event).
 - The translator attempts structured "blocks" Slack formatting first; if Slack rejects, it falls back to plain text.
 - Unknown or additional fields from Wowza are logged and ignored—they will not break processing.
+- After any changes to Server.xml or Webhooks.json, you must restart Wowza Streaming Engine for changes to take effect.
 
-### 7. Updating / Removing the Webhook
-Use Wowza Manager (edit or disable) or issue a REST `PUT`/`DELETE` to the webhook endpoint (see Wowza docs) if you need to change URLs (e.g., move to `achepw0wz` published image).
+### 7. Supported Webhook Events
+This translator handles the following Wowza webhook events:
+- **Application events:** `app.started`, `app.shutdown`
+- **Stream events:** `stream.started`, `stream.stopped`
+- **Recording events:** `recording.started`, `recording.stopped`, `recording.failed`, `recording.segment.started`, `recording.segment.ended`
+- **Re-streaming events:** `connection.started`, `connection.success`, `connection.failure`
+- **Custom events:** Unknown events are logged and sent to Slack with raw JSON payload
 
-### 8. Basic Payload Shape (Example)
+For detailed event structures and additional configuration options, see the [Wowza webhook documentation](https://www.wowza.com/docs/create-webhooks-to-monitor-streaming-events-in-wowza-streaming-engine).
+
+### 8. Webhook Payload Structure
+Wowza Streaming Engine sends webhook events with the following structure:
 ```json
 {
-	"event": "streamStart",
-	"appName": "live",
-	"streamName": "demoStream",
-	"timestamp": 1732212345678
+  "id": "unique-event-id",
+  "timestamp": 1758657755812,
+  "name": "stream.started",
+  "source": "myWSEInstanceName",
+  "version": "1.0",
+  "context": {
+    "app": "live",
+    "appInstance": "_definst_",
+    "stream": "myStream",
+    "state": "started",
+    "vhost": "_defaultVHost_"
+  },
+  "data": {}
 }
 ```
-Additional Wowza-specific fields (e.g. `instanceName`, `ipAddress`, `sessionId`) will be logged and may be included in Slack formatting as support expands.
+
+**Key fields:**
+- `name`: Event type (e.g., `stream.started`, `recording.failed`)
+- `context`: Contains app, stream, vhost, and state information
+- `data`: Additional event-specific data (e.g., output file for recordings, error messages)
+- `timestamp`: Unix timestamp in milliseconds
+- `source`: Your Wowza Streaming Engine instance name
+
+The translator automatically parses these fields and formats them into human-readable Slack messages. Unknown fields are logged and safely ignored.
 
 If you need to support an event that is not currently rendered cleanly in Slack, capture a sample payload from logs and open an issue or extend `translate_payload` in `http_server.py`.
 
