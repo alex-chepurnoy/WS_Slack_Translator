@@ -91,15 +91,12 @@ Additional Wowza-specific fields (e.g. `instanceName`, `ipAddress`, `sessionId`)
 
 If you need to support an event that is not currently rendered cleanly in Slack, capture a sample payload from logs and open an issue or extend `translate_payload` in `http_server.py`.
 
-## Deployment Options
+## Deployment
 
-Choose one of the following deployment methods:
+This application is designed for Docker deployment. See **[DOCKER_README.md](DOCKER_README.md)** for complete instructions.
 
-### Option 1: Docker (Recommended for Production)
+### Quick Start
 
-The easiest way to deploy this application is using Docker. See **[DOCKER_README.md](DOCKER_README.md)** for complete instructions.
-
-**Quick Start:**
 ```bash
 # Copy environment template
 cp .env.example .env
@@ -115,91 +112,24 @@ docker-compose logs -f
 ```
 
 Or use the quick start scripts:
-- Linux/Mac: `./docker-quickstart.sh`
-- Windows: `.\docker-quickstart.ps1`
+- **Linux/Mac:** `./docker-quickstart.sh`
+- **Windows:** `.\docker-quickstart.ps1`
 
-### Option 2: Windows Native Install
+### Configuration
+- Set `SLACK_WEBHOOK_URL` in `.env` file (required)
+- Optional: `LOG_LEVEL` (DEBUG, INFO, WARNING, ERROR)
+- Optional: `PORT` (default: 8080)
+- Optional: `VI_BATCH_WINDOW` (default: 10 seconds)
 
-Recommended: use the provided installer script which automates Python, dependencies, and service registration.
-
-1. Download the project from GitHub (clone or Download ZIP) and extract.
-2. Open PowerShell as Administrator in the extracted folder.
-3. Run the installer (example):
-
-```powershell
-.\install_windows.ps1 -InstallDir "C:\Program Files\WS_Slack_Translator" -WebhookUrl "https://hooks.slack.com/services/XXX/YYY/ZZZ"
-```
-
-What the installer does (summary)
-- Ensures Python is installed (optionally downloading official installer)
-- Installs Python packages from `requirements.txt`
-- Downloads NSSM and registers an NSSM service to run the translator under the chosen install directory
-- Optionally writes `config.json` with the provided webhook URL
-
-Notes for Windows
-- The installer requires Administrator rights.
-- The service created by the installer runs the translator with its working directory set to the install folder so `config.json` is found.
-
-Manual Windows (only for development/testing)
-- If you don't want to use the installer, install Python, create `config.json` or set `SLACK_WEBHOOK_URL`, and run `python http_server.py` from the project folder. This is intended for testing, not production.
-
-### Option 3: Linux Native Install
-This section describes a straightforward manual setup using a virtualenv and a systemd service. You can adapt these steps to your distro and preferred user account.
-
-1. Clone the repo on the target machine and create a virtualenv:
-
-```bash
-git clone <repo-url> /opt/ws-slack-translator
-cd /opt/ws-slack-translator
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-2. Create `config.json` in the project folder with your Slack webhook URL, for example:
-
-```json
-{
-	"slack_webhook_url": "https://hooks.slack.com/services/XXX/YYY/ZZZ"
-}
-```
-
-3. Create a `systemd` service unit (example `/etc/systemd/system/ws-slack-translator.service`):
-
-```ini
-[Unit]
-Description=WS Slack Translator
-After=network.target
-
-[Service]
-User=www-data
-WorkingDirectory=/opt/ws-slack-translator
-ExecStart=/opt/ws-slack-translator/venv/bin/python /opt/ws-slack-translator/http_server.py
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
-4. Enable & start the service:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable ws-slack-translator
-sudo systemctl start ws-slack-translator
-sudo journalctl -u ws-slack-translator -f
-```
-
-Configuration
--------------
-- `config.json` currently only stores the Slack Incoming Webhook URL (key: `slack_webhook_url`).
-- Alternatively set `SLACK_WEBHOOK_URL` in the environment for the service.
+Alternatively, mount a `config.json` file with your configuration (see DOCKER_README.md for details).
 
 
-Troubleshooting
----------------
-- If webhooks return 404: ensure the running process is the translator (and not another file) and that it is listening on port 8080. Restart the service to pick up code changes.
-- If Slack messages fail: check `logs/` (service stdout/stderr) and confirm `config.json` or `SLACK_WEBHOOK_URL` is set.
+## Troubleshooting
+
+- **Webhooks return 404:** Ensure the container is running (`docker-compose ps`) and listening on port 8080. Check container logs with `docker-compose logs -f`.
+- **Slack messages not appearing:** Verify `SLACK_WEBHOOK_URL` is correctly set in `.env` or `config.json`. Check container logs for errors.
+- **Container won't start:** Ensure port 8080 is not already in use. Check Docker logs: `docker-compose logs`.
+- **Health check failing:** Verify the container is running and accessible: `curl http://localhost:8080/health`
 
 
 License
