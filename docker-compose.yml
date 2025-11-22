@@ -4,6 +4,7 @@ services:
     # Local build plus explicit Docker Hub image tag for consistency
     image: achepw0wz/wowza-webhook-to-slack:latest
     container_name: wowza-webhook-to-slack
+    hostname: wse.translator.slack
     ports:
       - "${PORT:-8080}:8080"
     environment:
@@ -20,8 +21,6 @@ services:
     volumes:
       # Mount logs directory to persist logs
       - ./logs:/app/logs
-      # Optional: Mount config.json if you prefer file-based config
-      - ./config.json:/app/config.json:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
@@ -29,3 +28,10 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    networks:
+      - wowza-network
+
+networks:
+  wowza-network:
+    name: wowza-network
+    driver: bridge

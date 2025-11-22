@@ -62,25 +62,7 @@ This Docker image translates Wowza Streaming Engine webhook events into formatte
 | `SLACK_WEBHOOK_URL` | Yes | - | Your Slack Incoming Webhook URL |
 | `LOG_LEVEL` | No | INFO | Logging level (DEBUG, INFO, WARNING, ERROR) |
 | `PORT` | No | 8080 | External port to expose (container always runs on 8080 internally) |
-
-### Alternative: Using config.json
-
-Instead of environment variables, you can mount a `config.json` file:
-
-1. **Create `config.json`:**
-   ```json
-   {
-     "slack_webhook_url": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
-   }
-   ```
-
-2. **Mount it in docker-compose.yml** (already configured):
-   ```yaml
-   volumes:
-     - ./config.json:/app/config.json:ro
-   ```
-
-**Note:** Environment variables take precedence over `config.json`.
+| `VI_BATCH_WINDOW` | No | 10 | Video Intelligence detection batching window in seconds |
 
 ## Getting Your Slack Webhook URL
 
@@ -137,16 +119,44 @@ The translator supports all Wowza webhook events with enhanced formatting for:
 
 The container includes a health check endpoint:
 
+**From Docker host:**
 ```bash
 curl http://localhost:8080/health
-# or from inside the container:
-wget --spider http://localhost:8080/health
+```
+
+**From another container in the same network:**
+```bash
+curl http://wse.translator.slack:8080/health
 ```
 
 Response:
 ```json
 {"status": "healthy", "service": "wowza-webhook-to-slack"}
 ```
+
+## Docker Networking
+
+The service is configured with a dedicated Docker network named `wowza-network`. 
+
+**Service hostname:** `wse.translator.slack`
+
+### Connecting Wowza Streaming Engine
+
+If your Wowza Streaming Engine is also running in Docker, add it to the same network:
+
+```yaml
+services:
+  wowza:
+    # ... your wowza config
+    networks:
+      - wowza-network
+
+networks:
+  wowza-network:
+    external: true
+```
+
+Then configure Wowza's `Webhooks.json` to use: `http://wse.translator.slack:8080/webhook`
 
 ## Logs
 
@@ -167,6 +177,7 @@ cat logs/server.log
 
 Test the webhook endpoint manually:
 
+**From Docker host:**
 ```bash
 curl -X POST http://localhost:8080/webhook \
   -H "Content-Type: application/json" \

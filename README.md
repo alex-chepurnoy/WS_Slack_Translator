@@ -3,7 +3,14 @@
 
 Purpose
 -------
-WS Slack Translator receives webhook POSTs from Wowza Streaming Engine, converts each event into an English, human-readable message, and forwards it to Slack using an Incoming Webhook. It's intended to make Wowza events (stream starts/stops, recording state, connection issues, app lifecycle) easy to monitor in Slack channels.
+WS Slack Translator receives webhook POSTs from Wowza Streaming Engine, converts each event into an English, human-readable message, and forwards it to Slack using an Incoming Webhook. It's intended to make Wowza events (stream starts/stops, recording state, connection issues, app lifecycle, and AI-based Video Intelligence detections) easy to monitor in Slack channels.
+
+**Key Features:**
+- 📊 Real-time streaming event notifications
+- 🎯 Smart batching for Video Intelligence AI detections
+- 🔔 Formatted Slack messages with blocks and fallback text
+- 🐳 Docker-first deployment with health checks
+- ⚙️ Simple .env file configuration
 
 Relevant docs
 -------------
@@ -14,19 +21,26 @@ Relevant docs
 Follow these steps to have Wowza Streaming Engine publish its events to this service (and onward to Slack):
 
 ### 1. Confirm the Translator Is Reachable
-Ensure the container or process is running and listening on port `8080`.
+Ensure the container is running and listening on port `8080`.
 
 Health check:
 ```bash
-curl -s http://localhost:8080/health
+curl -s http://wse.translator.slack:8080/health
 ```
-Expected response: `{"status":"ok"}` (HTTP 200).
+Expected response: `{"status":"healthy"}` (HTTP 200).
+
+**Note:** From the Docker host, use `http://localhost:8080/health`
 
 ### 2. Determine the Webhook URL
-- Same host (native Wowza, translator in Docker): use `http://localhost:8080/webhook`.
-- Same host (both in Docker Compose user-defined network): use `http://wowza-webhook-to-slack:8080/webhook` from the Wowza container if you add both services to the same network.
-- Different host: use `http://<translator_host_ip_or_dns>:8080/webhook` and ensure firewall access.
-- Behind reverse proxy: map external URL to internal `:8080` and use that external URL.
+
+**Recommended (Docker network):** `http://wse.translator.slack:8080/webhook`
+- Use this when Wowza Streaming Engine is in the same Docker Compose network
+- This is the standard hostname for the translator service
+
+**Alternative scenarios:**
+- Native Wowza on same host: `http://localhost:8080/webhook`
+- Different host: `http://<translator_host_ip_or_dns>:8080/webhook` (ensure firewall access)
+- Behind reverse proxy: map external URL to internal `:8080`
 
 ### 3. Configure Server.xml
 Edit your Wowza Streaming Engine Server.xml file to load the WebhookListener module:
@@ -60,7 +74,7 @@ Edit the Webhooks.json file to define webhook targets and filters:
     "targets": [
       {
         "id": "slackTranslator",
-        "url": "http://localhost:8080/webhook",
+        "url": "http://wse.translator.slack:8080/webhook",
         "headers": []
       }
     ]
@@ -79,7 +93,7 @@ Edit the Webhooks.json file to define webhook targets and filters:
 ### 5. Test With a Manual POST
 You can simulate Wowza by sending a test payload to verify the translator is working:
 ```bash
-curl -X POST http://localhost:8080/webhook \
+curl -X POST http://wse.translator.slack:8080/webhook \
 	-H 'Content-Type: application/json' \
 	-d '{
 		"name": "stream.started",
@@ -98,8 +112,8 @@ curl -X POST http://localhost:8080/webhook \
 Check your Slack channel for a formatted message. If nothing appears, inspect container logs with `docker-compose logs -f` and confirm `SLACK_WEBHOOK_URL` is set.
 
 ### 6. Common Integration Notes
-- If Wowza runs as a Windows service and translator runs in Docker on the same Windows host, `localhost` works.
-- If Wowza is inside Docker, ensure both containers share a user-defined bridge network and reference the translator service name.
+- **Docker deployment (recommended):** Use `http://wse.translator.slack:8080/webhook` when Wowza and the translator share a Docker network.
+- **Native Wowza:** If Wowza runs as a native service on the same host, use `http://localhost:8080/webhook`.
 - For high-volume environments, consider rate limiting or batching on the Slack side (this translator sends per-event).
 - The translator attempts structured "blocks" Slack formatting first; if Slack rejects, it falls back to plain text.
 - Unknown or additional fields from Wowza are logged and ignored—they will not break processing.
@@ -111,6 +125,7 @@ This translator handles the following Wowza webhook events:
 - **Stream events:** `stream.started`, `stream.stopped`
 - **Recording events:** `recording.started`, `recording.stopped`, `recording.failed`, `recording.segment.started`, `recording.segment.ended`
 - **Re-streaming events:** `connection.started`, `connection.success`, `connection.failure`
+- **Video Intelligence events:** `video.intelligence.detection` (AI-based object detection with smart batching)
 - **Custom events:** Unknown events are logged and sent to Slack with raw JSON payload
 
 For detailed event structures and additional configuration options, see the [Wowza webhook documentation](https://www.wowza.com/docs/create-webhooks-to-monitor-streaming-events-in-wowza-streaming-engine).
@@ -146,6 +161,47 @@ The translator automatically parses these fields and formats them into human-rea
 
 If you need to support an event that is not currently rendered cleanly in Slack, capture a sample payload from logs and open an issue or extend `translate_payload` in `http_server.py`.
 
+## Video Intelligence (AI Detection) Support
+
+The translator includes intelligent batching for Video Intelligence (AI object detection) events to prevent Slack notification spam.
+
+### How It Works
+- **Smart Batching:** AI detection events are aggregated over a configurable time window (default: 10 seconds) per stream
+- **Automatic Summarization:** Batched detections are combined into a single summary message showing:
+  - Total detection count
+  - Object class breakdown (e.g., "15× person", "8× car")
+  - Average confidence scores per class
+  - Detection period duration
+- **Spam Prevention:** Instead of sending hundreds of individual messages for continuous AI detections, you receive periodic summaries
+
+### Configuration
+Set the batching window via environment variable:
+```bash
+VI_BATCH_WINDOW=10  # seconds (default: 10)
+```
+
+In `.env` file:
+```env
+VI_BATCH_WINDOW=15  # Adjust based on your monitoring needs
+```
+
+### Example Slack Message
+```
+🔍 AI Detection Summary
+Stream: myStream
+App: live
+Duration: 9.8s
+Total Detections: 147
+Classes: 89× person (avg 94%), 45× car (avg 88%), 13× bicycle (avg 82%)
+Period: 14:23:10 - 14:23:20
+```
+
+### Notes
+- Each stream's detections are batched independently
+- The batch timer resets with each new detection
+- Batches are flushed automatically after the configured window expires
+- Useful for high-frequency AI analysis scenarios (e.g., crowd monitoring, traffic analysis)
+
 ## Deployment
 
 This application is designed for Docker deployment. See **[DOCKER_README.md](DOCKER_README.md)** for complete instructions.
@@ -171,18 +227,17 @@ Or use the quick start scripts:
 - **Windows:** `.\docker-quickstart.ps1`
 
 ### Configuration
-- Set `SLACK_WEBHOOK_URL` in `.env` file (required)
-- Optional: `LOG_LEVEL` (DEBUG, INFO, WARNING, ERROR)
-- Optional: `PORT` (default: 8080)
-- Optional: `VI_BATCH_WINDOW` (default: 10 seconds)
-
-Alternatively, mount a `config.json` file with your configuration (see DOCKER_README.md for details).
-
+- **`SLACK_WEBHOOK_URL`** (required): Your Slack Incoming Webhook URL
+- **`LOG_LEVEL`** (optional): Logging verbosity - `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`)
+- **`PORT`** (optional): External port to expose (default: `8080`)
+- **`VI_BATCH_WINDOW`** (optional): Video Intelligence detection batching window in seconds (default: `10`)
+  - Increase for less frequent AI detection summaries
+  - Decrease for more real-time updates (may increase Slack message volume)
 
 ## Troubleshooting
 
 - **Webhooks return 404:** Ensure the container is running (`docker-compose ps`) and listening on port 8080. Check container logs with `docker-compose logs -f`.
-- **Slack messages not appearing:** Verify `SLACK_WEBHOOK_URL` is correctly set in `.env` or `config.json`. Check container logs for errors.
+- **Slack messages not appearing:** Verify `SLACK_WEBHOOK_URL` is correctly set in `.env`. Check container logs for errors.
 - **Container won't start:** Ensure port 8080 is not already in use. Check Docker logs: `docker-compose logs`.
 - **Health check failing:** Verify the container is running and accessible: `curl http://localhost:8080/health`
 
