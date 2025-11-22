@@ -5,6 +5,9 @@ import os
 import json
 from pathlib import Path
 from datetime import datetime, timezone
+import threading
+import time
+from collections import defaultdict
 
 # Configure logging to log to both a file and the console
 LOG_DIR = Path(os.environ.get('LOG_DIR', 'logs'))
@@ -63,8 +66,93 @@ CONFIG = load_config()
 # Initialize Flask app
 app = Flask(__name__)
 
+# Video Intelligence batching configuration
+VI_BATCH_WINDOW = int(os.environ.get('VI_BATCH_WINDOW', '10'))  # seconds
+vi_batch_lock = threading.Lock()
+vi_batch_data = defaultdict(lambda: {'detections': [], 'first_seen': None, 'last_seen': None})
+vi_batch_timer = None
+
 # Test log message to confirm logging works
 logging.info("HTTP server is starting. Logging is configured correctly.")
+
+
+def flush_vi_batch():
+    """Flush accumulated video intelligence detections to Slack as a summary."""
+    global vi_batch_timer
+    
+    with vi_batch_lock:
+        if not vi_batch_data:
+            vi_batch_timer = None
+            return
+        
+        # Process each stream's batched data
+        for stream_key, batch in list(vi_batch_data.items()):
+            app_name, stream_name = stream_key.split('|', 1)
+            detections = batch['detections']
+            first_seen = batch['first_seen']
+            last_seen = batch['last_seen']
+            
+            # Aggregate statistics
+            total_count = len(detections)
+            class_counts = defaultdict(int)
+            confidence_sum = defaultdict(float)
+            
+            for det in detections:
+                cls = det['class_name']
+                class_counts[cls] += 1
+                confidence_sum[cls] += det['confidence']
+            
+            # Calculate averages
+            class_summary = []
+            for cls in sorted(class_counts.keys(), key=lambda x: -class_counts[x]):
+                count = class_counts[cls]
+                avg_conf = confidence_sum[cls] / count
+                class_summary.append(f"{count}× {cls} (avg {avg_conf:.0%})")
+            
+            duration = (last_seen - first_seen).total_seconds() if first_seen and last_seen else 0
+            
+            # Build Slack message
+            title = f":eye: AI Detection Summary"
+            detail_lines = [
+                f"*Stream:* `{stream_name}`",
+                f"*App:* `{app_name}`",
+                f"*Duration:* {duration:.1f}s",
+                f"*Total Detections:* {total_count}",
+                f"*Classes:* {', '.join(class_summary)}",
+                f"*Period:* {first_seen.strftime('%H:%M:%S')} - {last_seen.strftime('%H:%M:%S')}"
+            ]
+            
+            blocks = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*"}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(detail_lines)}}
+            ]
+            
+            text = f"AI Detection: {total_count} objects detected on {stream_name} over {duration:.1f}s"
+            message = (text, blocks, 'low')
+            
+            # Send to Slack
+            try:
+                send_to_slack(message)
+                logging.info(f"Flushed VI batch for {stream_key}: {total_count} detections")
+            except Exception as e:
+                logging.error(f"Failed to send batched VI summary: {e}", exc_info=True)
+        
+        # Clear batch
+        vi_batch_data.clear()
+        vi_batch_timer = None
+
+
+def schedule_vi_batch_flush():
+    """Schedule a batch flush after the configured window."""
+    global vi_batch_timer
+    
+    with vi_batch_lock:
+        if vi_batch_timer is not None:
+            return  # Timer already running
+        
+        vi_batch_timer = threading.Timer(VI_BATCH_WINDOW, flush_vi_batch)
+        vi_batch_timer.daemon = True
+        vi_batch_timer.start()
 
 
 def translate_payload(payload):
@@ -106,9 +194,9 @@ def translate_payload(payload):
             if raw_payload:
                 try:
                     raw_json_short = json.dumps(raw_payload, indent=2)
-                    if len(raw_json_short) > 1500:
-                        raw_json_short = raw_json_short[:1500] + "\n... (truncated)"
-                    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Raw Event (truncated):*\n```{raw_json_short}```"}})
+                    if len(raw_json_short) > 2800:
+                        raw_json_short = raw_json_short[:2800] + "\n... (truncated)"
+                    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Raw Event:*\n```{raw_json_short}```"}})
                 except Exception:
                     pass
             return blocks
@@ -156,6 +244,38 @@ def translate_payload(payload):
             title = "Recording segment ended"
             detail_lines = [f"*Stream:* `{stream}`", f"*App:* `{app}`", f"*AppInstance:* `{context.get('appInstance','_definst_')}`", f"*Segment:* {data.get('segmentId', data.get('segment','N/A'))}", f"*Time:* {ts_str}"]
 
+        # Video Intelligence events - BATCH mode
+        elif event_name in ("video.intelligence.detection",):
+            # Add detections to batch instead of immediate send
+            vi_data = data.get('vi_data', [])
+            stream_key = f"{app}|{stream}"
+            current_time = datetime.now()
+            
+            with vi_batch_lock:
+                batch = vi_batch_data[stream_key]
+                
+                # Initialize timestamps
+                if batch['first_seen'] is None:
+                    batch['first_seen'] = current_time
+                batch['last_seen'] = current_time
+                
+                # Add all detections to batch
+                for frame_data in vi_data:
+                    for detection in frame_data.get('detections', []):
+                        batch['detections'].append({
+                            'class_name': detection.get('class_name', 'unknown'),
+                            'confidence': detection.get('confidence', 0),
+                            'frame_id': detection.get('frame_id', 0)
+                        })
+                
+                logging.debug(f"Batched {len(vi_data)} VI frames for {stream_key}, total: {len(batch['detections'])}")
+            
+            # Schedule flush if not already scheduled
+            schedule_vi_batch_flush()
+            
+            # Return None to skip immediate Slack send
+            return None
+
         # Re-streaming / MediaCaster / connection events
         elif event_name in ("connection.failure", "connect.failure", "connect.failed"):
             title = "Connection failure"
@@ -171,17 +291,41 @@ def translate_payload(payload):
             detail_lines = [f"*Stream:* `{stream}`", f"*App:* `{app}`", f"*AppInstance:* `{context.get('appInstance','_definst_')}`", f"*Endpoint:* {context.get('endpoint','N/A')}", f"*VHost:* `{vhost}`", f"*Time:* {ts_str}"]
             header_icon = ":white_check_mark:"
 
-        # Generic fallback: look for 'failed' or 'error' in payload to mark high severity
+        # Generic fallback: send raw JSON in Slack blocks for unrecognized events
         else:
-            # If any 'failed' like token exists, escalate
+            logging.info("Unrecognized event '%s', sending raw JSON payload to Slack.", event_name)
+            
+            # If any 'failed' like token exists, escalate severity
             searchable = json.dumps(payload).lower()
             if any(tok in searchable for tok in ('fail', 'failed', 'error', 'failure', 'exception')):
                 severity = 'high'
                 header_icon = ":rotating_light:"
-            title = event_name.replace('.', ' ').title()
-            detail_lines = [f"*Stream:* `{stream}`", f"*App:* `{app}`", f"*VHost:* `{vhost}`", f"*State:* `{state}`", f"*Time:* {ts_str}"]
+            else:
+                header_icon = ":grey_question:"
+            
+            title = f"Unknown Event: {event_name.replace('.', ' ').title()}"
+            full_title = f"{header_icon} {title}"
+            
+            # Build blocks with only raw JSON (no detail_lines)
+            try:
+                raw_json = json.dumps(payload, indent=2)
+                if len(raw_json) > 2800:  # Leave room for markdown syntax
+                    raw_json = raw_json[:2800] + "\n... (truncated)"
+            except Exception:
+                raw_json = str(payload)
+            
+            blocks = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*{full_title}*"}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"```{raw_json}```"}}
+            ]
+            
+            text = f"{title} - Raw payload logged"
+            if severity == 'high':
+                text = ":rotating_light: " + text
+            
+            return text, blocks, severity
 
-        # Prepend the icon to title for visual emphasis
+        # Prepend the icon to title for visual emphasis (for recognized events)
         full_title = f"{header_icon} {title}"
 
         blocks = build_blocks(full_title, detail_lines, payload)
@@ -211,9 +355,13 @@ def wowza_webhook():
         logging.info("Parsed payload: %s", payload)
 
         message = translate_payload(payload)
-        logging.info("Translated message: %s", message)
-
-        send_to_slack(message)
+        
+        # Skip Slack send if batching (message will be None for VI detections)
+        if message is not None:
+            logging.info("Translated message: %s", message)
+            send_to_slack(message)
+        else:
+            logging.debug("Message batched, skipping immediate Slack send")
 
         return jsonify({"status": "success"}), 200
     except Exception as e:

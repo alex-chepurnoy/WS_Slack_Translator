@@ -9,6 +9,8 @@ services:
     # Production logging level
     environment:
       - LOG_LEVEL=WARNING
+      # Optional: VI detection batching window in seconds (default 10)
+      - VI_BATCH_WINDOW=${VI_BATCH_WINDOW:-10}
     
     # Resource limits
     deploy:
