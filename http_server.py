@@ -27,36 +27,18 @@ logging.basicConfig(
     ]
 )
 
-# Application folder (where config.json will live)
-APP_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = APP_DIR / 'config.json'
-
-
 def load_config():
-    """Load configuration from config.json or environment variables.
-
-    Priority: config.json > SLACK_WEBHOOK_URL env var
-    Returns a dict (may be empty).
+    """Load configuration from environment variables.
+    
+    Returns a dict with configuration.
     """
     cfg = {}
-    # Try config file
-    try:
-        if CONFIG_PATH.exists():
-            # Use utf-8-sig to gracefully handle files written with a UTF-8 BOM (PowerShell Out-File may add one)
-            with CONFIG_PATH.open('r', encoding='utf-8-sig') as f:
-                cfg = json.load(f)
-            logging.info("Loaded config.json from %s", CONFIG_PATH)
-    except json.JSONDecodeError as e:
-        logging.error("Failed to parse config.json (%s): %s", CONFIG_PATH, e)
-    except Exception:
-        logging.exception("Failed to load config.json")
-
-    # Fallback to environment variable
-    if 'slack_webhook_url' not in cfg or not cfg.get('slack_webhook_url'):
-        env_url = os.environ.get('SLACK_WEBHOOK_URL')
-        if env_url:
-            cfg['slack_webhook_url'] = env_url
-
+    slack_url = os.environ.get('SLACK_WEBHOOK_URL')
+    if slack_url:
+        cfg['slack_webhook_url'] = slack_url
+    else:
+        logging.warning("SLACK_WEBHOOK_URL not configured - Slack notifications will be skipped")
+    
     return cfg
 
 
@@ -66,14 +48,38 @@ CONFIG = load_config()
 # Initialize Flask app
 app = Flask(__name__)
 
+# Security configuration
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB limit for large VI webhooks
+app.config['JSON_SORT_KEYS'] = False  # Preserve JSON order for logging
+
+# Create requests session for connection pooling and timeouts
+http_session = requests.Session()
+http_session.timeout = 10  # Default 10s timeout
+
 # Video Intelligence batching configuration
 VI_BATCH_WINDOW = int(os.environ.get('VI_BATCH_WINDOW', '10'))  # seconds
 vi_batch_lock = threading.Lock()
 vi_batch_data = defaultdict(lambda: {'detections': [], 'first_seen': None, 'last_seen': None})
 vi_batch_timer = None
 
+# Shutdown flag for graceful termination
+shutdown_flag = threading.Event()
+
+def sanitize_url(url):
+    """Sanitize webhook URL for safe logging."""
+    if not url:
+        return "<not configured>"
+    # Show only protocol and domain, hide path/token
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}/***"
+    except:
+        return "<configured>"
+
 # Test log message to confirm logging works
-logging.info("HTTP server is starting. Logging is configured correctly.")
+slack_url = CONFIG.get('slack_webhook_url')
+logging.info(f"HTTP server is starting. Slack webhook: {sanitize_url(slack_url)}")
 
 
 def flush_vi_batch():
@@ -352,7 +358,10 @@ def wowza_webhook():
             logging.warning("No JSON payload received.")
             return jsonify({"status": "error", "message": "Invalid JSON payload."}), 400
 
-        logging.info("Parsed payload: %s", payload)
+        # Log payload only at DEBUG level to avoid sensitive data exposure
+        event_name = payload.get('name', 'unknown')
+        logging.info(f"Received event: {event_name}")
+        logging.debug("Full payload: %s", payload)
 
         message = translate_payload(payload)
         
@@ -366,7 +375,8 @@ def wowza_webhook():
         return jsonify({"status": "success"}), 200
     except Exception as e:
         logging.error("An error occurred while processing the webhook: %s", e, exc_info=True)
-        return jsonify({"status": "error", "message": str(e)}), 500
+        # Don't expose internal error details to external callers
+        return jsonify({"status": "error", "message": "Internal processing error"}), 500
 
 
 @app.route('/health', methods=['GET'])
@@ -449,29 +459,70 @@ def send_to_slack(message):
         if blocks:
             payload_blocks = {"text": text, "blocks": blocks}
             try:
-                resp = requests.post(slack_url, json=payload_blocks)
+                resp = http_session.post(slack_url, json=payload_blocks, timeout=10)
                 if resp.status_code == 200:
                     logging.info("Slack Blocks message sent successfully.")
                     return
                 else:
                     # If Slack rejects blocks (legacy workspace or webhook), log and fall back
-                    logging.warning("Slack Blocks send failed (status %s). Falling back to plain text. Response: %s", resp.status_code, resp.text)
+                    logging.warning("Slack Blocks send failed (status %s). Falling back to plain text.", resp.status_code)
+            except requests.exceptions.Timeout:
+                logging.error("Timeout sending Blocks to Slack. Falling back to plain text.")
             except Exception as e:
-                logging.warning("Exception when sending Blocks to Slack: %s. Falling back to plain text.", e, exc_info=True)
+                logging.warning("Exception when sending Blocks to Slack: %s. Falling back to plain text.", str(e))
 
         # Fall back to plain text
         slack_payload = {"text": text}
-        response = requests.post(slack_url, json=slack_payload)
-        if response.status_code == 200:
-            logging.info("Plain text message sent to Slack successfully.")
-        else:
-            logging.error("Failed to send plain text message to Slack: %s", response.text)
+        try:
+            response = http_session.post(slack_url, json=slack_payload, timeout=10)
+            if response.status_code == 200:
+                logging.info("Plain text message sent to Slack successfully.")
+            else:
+                logging.error("Failed to send plain text message to Slack (status %s)", response.status_code)
+        except requests.exceptions.Timeout:
+            logging.error("Timeout sending plain text to Slack")
+        except Exception as e:
+            logging.error("Exception sending plain text to Slack: %s", str(e))
     except Exception as e:
         logging.error("An exception occurred while sending to Slack: %s", e, exc_info=True)
 
+def shutdown_handler(signum, frame):
+    """Handle graceful shutdown on SIGTERM/SIGINT."""
+    logging.info("Shutdown signal received (%s). Flushing pending data...", signum)
+    shutdown_flag.set()
+    
+    # Flush any pending VI batches
+    try:
+        flush_vi_batch()
+        logging.info("VI batches flushed successfully.")
+    except Exception as e:
+        logging.error("Error flushing VI batches during shutdown: %s", e)
+    
+    # Cancel any pending timers
+    global vi_batch_timer
+    if vi_batch_timer is not None:
+        vi_batch_timer.cancel()
+        logging.info("Cancelled pending VI batch timer.")
+    
+    # Close HTTP session
+    try:
+        http_session.close()
+        logging.info("HTTP session closed.")
+    except Exception as e:
+        logging.error("Error closing HTTP session: %s", e)
+    
+    logging.info("Graceful shutdown complete.")
+
 if __name__ == '__main__':
+    import signal
+    
+    # Register shutdown handlers
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
+    
     # Get port from environment variable or default to 8080
     port = int(os.environ.get('PORT', 8080))
-    # Run the Flask app
-    logging.info("Starting Flask app on port %s.", port)
+    # Run the Flask app (development mode only - use Gunicorn in production)
+    logging.info("Starting Flask development server on port %s.", port)
+    logging.warning("WARNING: Using Flask development server. Use Gunicorn in production.")
     app.run(host='0.0.0.0', port=port)

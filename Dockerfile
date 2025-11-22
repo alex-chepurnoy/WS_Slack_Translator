@@ -27,5 +27,5 @@ ENV SLACK_WEBHOOK_URL=""
 ENV LOG_LEVEL="INFO"
 ENV LOG_DIR="/app/logs"
 
-# Run the application with unbuffered output for proper logging
-CMD ["python", "-u", "http_server.py"]
+# Run the application with Gunicorn production server
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--threads", "4", "--timeout", "30", "--access-logfile", "-", "--error-logfile", "-", "--log-level", "info", "http_server:app"]
