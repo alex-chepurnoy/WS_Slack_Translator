@@ -3,6 +3,7 @@ import requests
 import logging
 import os
 import json
+import signal
 from pathlib import Path
 from datetime import datetime, timezone
 import threading
@@ -54,10 +55,21 @@ app.config['JSON_SORT_KEYS'] = False  # Preserve JSON order for logging
 
 # Create requests session for connection pooling and timeouts
 http_session = requests.Session()
-http_session.timeout = 10  # Default 10s timeout
+# Note: timeout must be passed explicitly in each request call
+# Session objects don't support a default timeout attribute
 
 # Video Intelligence batching configuration
-VI_BATCH_WINDOW = int(os.environ.get('VI_BATCH_WINDOW', '10'))  # seconds
+try:
+    VI_BATCH_WINDOW = int(os.environ.get('VI_BATCH_WINDOW', '10'))  # seconds
+    if VI_BATCH_WINDOW < 1:
+        logging.warning(f"VI_BATCH_WINDOW={VI_BATCH_WINDOW} is too low, using default of 10s")
+        VI_BATCH_WINDOW = 10
+except (ValueError, TypeError) as e:
+    logging.error(f"Invalid VI_BATCH_WINDOW value, using default of 10s: {e}")
+    VI_BATCH_WINDOW = 10
+
+# Maximum detections per batch to prevent memory issues
+VI_MAX_BATCH_SIZE = int(os.environ.get('VI_MAX_BATCH_SIZE', '10000'))
 vi_batch_lock = threading.Lock()
 vi_batch_data = defaultdict(lambda: {'detections': [], 'first_seen': None, 'last_seen': None})
 vi_batch_timer = None
@@ -74,8 +86,145 @@ def sanitize_url(url):
         from urllib.parse import urlparse
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}/***"
-    except:
+    except Exception:
         return "<configured>"
+
+
+def calculate_iou(bbox1, bbox2):
+    """Calculate Intersection over Union between two bounding boxes.
+    
+    Args:
+        bbox1, bbox2: Dict with keys {x, y, w, h}
+    
+    Returns:
+        float: IoU score between 0.0 and 1.0
+    """
+    try:
+        # Validate bboxes have required keys
+        required_keys = {'x', 'y', 'w', 'h'}
+        if not (required_keys.issubset(bbox1.keys()) and required_keys.issubset(bbox2.keys())):
+            return 0.0
+        
+        x1, y1, w1, h1 = bbox1['x'], bbox1['y'], bbox1['w'], bbox1['h']
+        x2, y2, w2, h2 = bbox2['x'], bbox2['y'], bbox2['w'], bbox2['h']
+        
+        # Validate non-negative dimensions
+        if w1 <= 0 or h1 <= 0 or w2 <= 0 or h2 <= 0:
+            return 0.0
+        
+        # Calculate intersection area
+        x_overlap = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+        y_overlap = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+        intersection = x_overlap * y_overlap
+        
+        # Calculate union area
+        area1 = w1 * h1
+        area2 = w2 * h2
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    except (KeyError, TypeError, ValueError) as e:
+        logging.debug(f"IoU calculation failed: {e}")
+        return 0.0
+
+
+def track_objects(detections):
+    """Track unique objects across frames using spatial clustering.
+    
+    Args:
+        detections: List of detection dicts with bbox, frame_id, class_name
+    
+    Returns:
+        dict: {
+            'unique_count': int - number of unique tracks detected,
+            'frames_processed': int - number of frames analyzed,
+            'peak_occupancy': int - max objects in single frame,
+            'avg_occupancy': float - average objects per frame
+        }
+    """
+    if not detections:
+        return {'unique_count': 0, 'frames_processed': 0, 'peak_occupancy': 0, 'avg_occupancy': 0}
+    
+    # Configurable thresholds from environment variables
+    TRACK_EXPIRY = int(os.environ.get('VI_TRACK_EXPIRY', '30'))  # frames
+    IOU_THRESHOLD = float(os.environ.get('VI_IOU_THRESHOLD', '0.3'))  # 0.0-1.0
+    
+    # Group detections by frame
+    frames = defaultdict(list)
+    for det in detections:
+        # Validate detection has required fields
+        if 'bbox' in det and 'frame_id' in det and isinstance(det.get('bbox'), dict):
+            frames[det['frame_id']].append(det)
+    
+    if not frames:
+        return {'unique_count': 0, 'frames_processed': 0, 'peak_occupancy': 0, 'avg_occupancy': 0}
+    
+    # Sort frames chronologically
+    sorted_frames = sorted(frames.keys())
+    
+    # Active tracks: {track_id: {'bbox': {...}, 'last_frame': int, 'class': str}}
+    active_tracks = {}
+    all_tracks = set()  # Track all unique track IDs ever created
+    next_track_id = 1
+    
+    for frame_id in sorted_frames:
+        current_detections = frames[frame_id]
+        
+        # Expire old tracks (handle frame gaps)
+        frame_gap = frame_id - max([t['last_frame'] for t in active_tracks.values()], default=frame_id)
+        active_tracks = {tid: t for tid, t in active_tracks.items() 
+                        if (frame_id - t['last_frame']) <= TRACK_EXPIRY}
+        
+        # Greedy assignment: match detections to existing tracks
+        matched_tracks = set()
+        matched_detections = set()
+        
+        # Build list of (iou_score, track_id, detection_idx) for all possible matches
+        match_candidates = []
+        for det_idx, det in enumerate(current_detections):
+            for tid, track in active_tracks.items():
+                # Class must match
+                if track['class'] != det.get('class_name', 'unknown'):
+                    continue
+                
+                iou = calculate_iou(det['bbox'], track['bbox'])
+                if iou >= IOU_THRESHOLD:
+                    match_candidates.append((iou, tid, det_idx))
+        
+        # Sort by IoU score (highest first) for greedy assignment
+        match_candidates.sort(reverse=True, key=lambda x: x[0])
+        
+        # Assign matches greedily (best matches first, one-to-one)
+        for iou_score, tid, det_idx in match_candidates:
+            if tid not in matched_tracks and det_idx not in matched_detections:
+                # Update existing track
+                det = current_detections[det_idx]
+                active_tracks[tid]['bbox'] = det['bbox']
+                active_tracks[tid]['last_frame'] = frame_id
+                matched_tracks.add(tid)
+                matched_detections.add(det_idx)
+        
+        # Create new tracks for unmatched detections
+        for det_idx, det in enumerate(current_detections):
+            if det_idx not in matched_detections:
+                active_tracks[next_track_id] = {
+                    'bbox': det['bbox'],
+                    'last_frame': frame_id,
+                    'class': det.get('class_name', 'unknown')
+                }
+                all_tracks.add(next_track_id)
+                next_track_id += 1
+    
+    # Calculate statistics
+    peak_occupancy = max(len(dets) for dets in frames.values())
+    avg_occupancy = sum(len(dets) for dets in frames.values()) / len(frames)
+    
+    return {
+        'unique_count': len(all_tracks),  # Total unique tracks throughout batch
+        'frames_processed': len(sorted_frames),
+        'peak_occupancy': peak_occupancy,
+        'avg_occupancy': avg_occupancy
+    }
 
 # Test log message to confirm logging works
 slack_url = CONFIG.get('slack_webhook_url')
@@ -87,8 +236,12 @@ def flush_vi_batch():
     global vi_batch_timer
     
     with vi_batch_lock:
-        if not vi_batch_data:
+        # Cancel and clear timer reference first
+        if vi_batch_timer is not None:
+            vi_batch_timer.cancel()
             vi_batch_timer = None
+        
+        if not vi_batch_data:
             return
         
         # Process each stream's batched data
@@ -102,31 +255,50 @@ def flush_vi_batch():
             total_count = len(detections)
             class_counts = defaultdict(int)
             confidence_sum = defaultdict(float)
+            confidence_min = defaultdict(lambda: 1.0)
+            confidence_max = defaultdict(lambda: 0.0)
             
             for det in detections:
                 cls = det['class_name']
+                conf = det['confidence']
                 class_counts[cls] += 1
-                confidence_sum[cls] += det['confidence']
-            
-            # Calculate averages
-            class_summary = []
-            for cls in sorted(class_counts.keys(), key=lambda x: -class_counts[x]):
-                count = class_counts[cls]
-                avg_conf = confidence_sum[cls] / count
-                class_summary.append(f"{count}× {cls} (avg {avg_conf:.0%})")
+                confidence_sum[cls] += conf
+                confidence_min[cls] = min(confidence_min[cls], conf)
+                confidence_max[cls] = max(confidence_max[cls], conf)
             
             duration = (last_seen - first_seen).total_seconds() if first_seen and last_seen else 0
             
-            # Build Slack message
-            title = f":eye: AI Detection Summary"
+            # Perform object tracking
+            tracking_stats = track_objects(detections)
+            
+            # Build enhanced Slack message
+            title = ":eye: AI Detection Summary"
+            period_str = f"{first_seen.strftime('%H:%M:%S')} - {last_seen.strftime('%H:%M:%S')}" if first_seen and last_seen else "N/A"
+            
             detail_lines = [
-                f"*Stream:* `{stream_name}`",
-                f"*App:* `{app_name}`",
-                f"*Duration:* {duration:.1f}s",
-                f"*Total Detections:* {total_count}",
-                f"*Classes:* {', '.join(class_summary)}",
-                f"*Period:* {first_seen.strftime('%H:%M:%S')} - {last_seen.strftime('%H:%M:%S')}"
+                f"*Stream:* `{stream_name}` | *App:* `{app_name}`",
+                f"*Duration:* {duration:.1f}s ({period_str})",
+                "━━━━━━━━━━━━━━━━━━━━━━",
+                "",
+                f"*Unique People:* ~{tracking_stats['unique_count']} tracked",
+                f"*Peak Occupancy:* {tracking_stats['peak_occupancy']} people (max in single frame)",
+                f"*Frames Analyzed:* {tracking_stats['frames_processed']} frames",
+                "",
+                "*Detection Stats:*"
             ]
+            
+            # Add per-class statistics
+            for cls in sorted(class_counts.keys(), key=lambda x: -class_counts[x]):
+                count = class_counts[cls]
+                avg_conf = confidence_sum[cls] / count
+                min_conf = confidence_min[cls]
+                max_conf = confidence_max[cls]
+                detail_lines.append(f" • {cls.title()}: {count} detections, {avg_conf:.0%} avg ({min_conf:.0%} - {max_conf:.0%})")
+            
+            # Add detection rate
+            if duration > 0:
+                detection_rate = total_count / duration
+                detail_lines.append(f" • Detection rate: {detection_rate:.1f}/sec")
             
             blocks = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*"}},
@@ -153,8 +325,12 @@ def schedule_vi_batch_flush():
     global vi_batch_timer
     
     with vi_batch_lock:
-        if vi_batch_timer is not None:
+        if vi_batch_timer is not None and vi_batch_timer.is_alive():
             return  # Timer already running
+        
+        # Cancel any existing timer before creating new one
+        if vi_batch_timer is not None:
+            vi_batch_timer.cancel()
         
         vi_batch_timer = threading.Timer(VI_BATCH_WINDOW, flush_vi_batch)
         vi_batch_timer.daemon = True
@@ -257,6 +433,8 @@ def translate_payload(payload):
             stream_key = f"{app}|{stream}"
             current_time = datetime.now()
             
+            should_flush_early = False
+            
             with vi_batch_lock:
                 batch = vi_batch_data[stream_key]
                 
@@ -265,19 +443,30 @@ def translate_payload(payload):
                     batch['first_seen'] = current_time
                 batch['last_seen'] = current_time
                 
-                # Add all detections to batch
+                # Add all detections to batch with bounding box coordinates
                 for frame_data in vi_data:
                     for detection in frame_data.get('detections', []):
                         batch['detections'].append({
                             'class_name': detection.get('class_name', 'unknown'),
                             'confidence': detection.get('confidence', 0),
-                            'frame_id': detection.get('frame_id', 0)
+                            'frame_id': detection.get('frame_id', 0),
+                            'bbox': detection.get('bbox', {})
                         })
                 
-                logging.debug(f"Batched {len(vi_data)} VI frames for {stream_key}, total: {len(batch['detections'])}")
+                batch_size = len(batch['detections'])
+                logging.debug(f"Batched {len(vi_data)} VI frames for {stream_key}, total: {batch_size}")
+                
+                # Check if batch size exceeded
+                if batch_size >= VI_MAX_BATCH_SIZE:
+                    logging.warning(f"Batch size {batch_size} exceeded limit {VI_MAX_BATCH_SIZE}, flushing early")
+                    should_flush_early = True
             
-            # Schedule flush if not already scheduled
-            schedule_vi_batch_flush()
+            # Flush immediately if batch size exceeded
+            if should_flush_early:
+                flush_vi_batch()
+            else:
+                # Schedule flush if not already scheduled
+                schedule_vi_batch_flush()
             
             # Return None to skip immediate Slack send
             return None
@@ -292,7 +481,7 @@ def translate_payload(payload):
             title = "Connection started"
             detail_lines = [f"*Endpoint:* {context.get('endpoint','N/A')}", f"*Stream:* `{stream}`", f"*App:* `{app}`", f"*AppInstance:* `{context.get('appInstance','_definst_')}`", f"*VHost:* `{vhost}`", f"*Time:* {ts_str}"]
             header_icon = ":arrow_forward:"
-        elif event_name in ("connection.success", "connect.success", "connect.success", "connect.success"):
+        elif event_name in ("connection.success", "connect.success", "connection.succeeded", "connect.succeeded"):
             title = "Connection success"
             detail_lines = [f"*Stream:* `{stream}`", f"*App:* `{app}`", f"*AppInstance:* `{context.get('appInstance','_definst_')}`", f"*Endpoint:* {context.get('endpoint','N/A')}", f"*VHost:* `{vhost}`", f"*Time:* {ts_str}"]
             header_icon = ":white_check_mark:"
@@ -491,18 +680,20 @@ def shutdown_handler(signum, frame):
     logging.info("Shutdown signal received (%s). Flushing pending data...", signum)
     shutdown_flag.set()
     
-    # Flush any pending VI batches
+    # Flush any pending VI batches (this acquires the lock and cancels timer)
     try:
         flush_vi_batch()
         logging.info("VI batches flushed successfully.")
     except Exception as e:
         logging.error("Error flushing VI batches during shutdown: %s", e)
     
-    # Cancel any pending timers
+    # Timer is already cancelled by flush_vi_batch(), but double-check
     global vi_batch_timer
-    if vi_batch_timer is not None:
-        vi_batch_timer.cancel()
-        logging.info("Cancelled pending VI batch timer.")
+    with vi_batch_lock:
+        if vi_batch_timer is not None:
+            vi_batch_timer.cancel()
+            vi_batch_timer = None
+            logging.info("Cancelled pending VI batch timer.")
     
     # Close HTTP session
     try:
@@ -514,9 +705,7 @@ def shutdown_handler(signum, frame):
     logging.info("Graceful shutdown complete.")
 
 if __name__ == '__main__':
-    import signal
-    
-    # Register shutdown handlers
+    # Register shutdown handlers (signal already imported at top)
     signal.signal(signal.SIGTERM, shutdown_handler)
     signal.signal(signal.SIGINT, shutdown_handler)
     
