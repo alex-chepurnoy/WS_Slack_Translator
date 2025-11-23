@@ -36,6 +36,8 @@ test_http_server.py
 requirements-test.txt
 run-tests.ps1
 run-tests.sh
+test-docker.ps1
+test-docker.sh
 TEST_GUIDE.md
 TESTING.md
 .pytest_cache/
