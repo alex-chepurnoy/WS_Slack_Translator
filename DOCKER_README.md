@@ -63,6 +63,9 @@ This Docker image translates Wowza Streaming Engine webhook events into formatte
 | `LOG_LEVEL` | No | INFO | Logging level (DEBUG, INFO, WARNING, ERROR) |
 | `PORT` | No | 8080 | External port to expose (container always runs on 8080 internally) |
 | `VI_BATCH_WINDOW` | No | 10 | Video Intelligence detection batching window in seconds |
+| `VI_MAX_BATCH_SIZE` | No | 10000 | Maximum detections per batch before early flush (memory protection) |
+| `VI_TRACK_EXPIRY` | No | 30 | Frames before object track expires (tracking algorithm) |
+| `VI_IOU_THRESHOLD` | No | 0.3 | IoU threshold for object matching, 0.0-1.0 (tracking algorithm) |
 
 ## Getting Your Slack Webhook URL
 

@@ -30,3 +30,16 @@ config.json
 venv/
 env/
 ENV/
+
+# Unit tests and test infrastructure (for local development only)
+test_http_server.py
+requirements-test.txt
+run-tests.ps1
+run-tests.sh
+TEST_GUIDE.md
+TESTING.md
+.pytest_cache/
+htmlcov/
+.coverage
+*.coverage
+

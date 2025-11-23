@@ -163,44 +163,80 @@ If you need to support an event that is not currently rendered cleanly in Slack,
 
 ## Video Intelligence (AI Detection) Support
 
-The translator includes intelligent batching for Video Intelligence (AI object detection) events to prevent Slack notification spam.
+The translator includes intelligent batching and object tracking for Video Intelligence (AI object detection) events to prevent Slack notification spam and provide actionable insights.
 
 ### How It Works
 - **Smart Batching:** AI detection events are aggregated over a configurable time window (default: 10 seconds) per stream
+- **Object Tracking:** Advanced multi-frame tracking using Intersection over Union (IoU) algorithms to count unique people across frames
 - **Automatic Summarization:** Batched detections are combined into a single summary message showing:
-  - Total detection count
-  - Object class breakdown (e.g., "15× person", "8× car")
-  - Average confidence scores per class
-  - Detection period duration
+  - **Unique object count** - tracks individual people across frames (not just raw detections)
+  - **Peak occupancy** - maximum number of people in a single frame
+  - **Detection statistics** - per-class breakdown with confidence ranges
+  - **Detection rate** - detections per second
+  - **Time period** - start and end timestamps
+- **Memory Protection:** Automatic early flush when batch size exceeds limits to prevent memory issues
 - **Spam Prevention:** Instead of sending hundreds of individual messages for continuous AI detections, you receive periodic summaries
 
 ### Configuration
-Set the batching window via environment variable:
-```bash
-VI_BATCH_WINDOW=10  # seconds (default: 10)
+Configure via environment variables in your `.env` file:
+
+```env
+# Batching time window in seconds (default: 10)
+VI_BATCH_WINDOW=10
+
+# Maximum detections per batch before early flush (default: 10000)
+VI_MAX_BATCH_SIZE=10000
+
+# Optional: Fine-tune tracking algorithm
+VI_TRACK_EXPIRY=30      # Frames before track expires (default: 30)
+VI_IOU_THRESHOLD=0.3    # IoU threshold for matching (default: 0.3)
 ```
 
-In `.env` file:
-```env
-VI_BATCH_WINDOW=15  # Adjust based on your monitoring needs
-```
+**Recommendations:**
+- **High-traffic streams:** Decrease `VI_BATCH_WINDOW` to 5-10s for more frequent updates
+- **Low-traffic streams:** Increase to 15-30s to reduce message frequency
+- **Memory-constrained environments:** Lower `VI_MAX_BATCH_SIZE` to 5000 or less
 
 ### Example Slack Message
 ```
-🔍 AI Detection Summary
-Stream: myStream
-App: live
-Duration: 9.8s
-Total Detections: 147
-Classes: 89× person (avg 94%), 45× car (avg 88%), 13× bicycle (avg 82%)
-Period: 14:23:10 - 14:23:20
+👁️ AI Detection Summary
+
+Stream: lobby-camera | App: live
+Duration: 9.8s (14:23:10 - 14:23:20)
+━━━━━━━━━━━━━━━━━━━━━━
+
+Unique People: ~12 tracked
+Peak Occupancy: 8 people (max in single frame)
+Frames Analyzed: 147 frames
+
+Detection Stats:
+ • Person: 147 detections, 94% avg (88% - 98%)
+ • Detection rate: 15.0/sec
 ```
 
+### How Object Tracking Works
+The translator uses sophisticated computer vision algorithms to identify unique individuals:
+
+1. **Bounding Box Analysis:** Each detection includes position and size information
+2. **IoU Matching:** Tracks objects across frames by comparing bounding box overlap
+3. **Temporal Tracking:** Maintains object identity even with brief occlusions
+4. **Class Filtering:** Only matches detections of the same class (person-to-person)
+
+This means you get accurate people counts, not just detection counts. If the same person appears in 50 consecutive frames, it's counted as 1 unique person, not 50 detections.
+
+### Use Cases
+- **Crowd Monitoring:** Track unique visitor counts and peak occupancy
+- **Traffic Analysis:** Monitor vehicle flow and congestion
+- **Security:** Alert on unusual occupancy patterns
+- **Retail Analytics:** Understand customer flow and dwell times
+- **Queue Management:** Monitor line lengths and wait times
+
 ### Notes
-- Each stream's detections are batched independently
-- The batch timer resets with each new detection
-- Batches are flushed automatically after the configured window expires
-- Useful for high-frequency AI analysis scenarios (e.g., crowd monitoring, traffic analysis)
+- Each stream's detections are batched and tracked independently
+- Batches flush automatically after the configured window expires
+- Early flush triggers if `VI_MAX_BATCH_SIZE` is exceeded (memory protection)
+- Tracking state resets between batches
+- Works with any Wowza Video Intelligence detection events
 
 ## Deployment
 
@@ -227,12 +263,26 @@ Or use the quick start scripts:
 - **Windows:** `.\docker-quickstart.ps1`
 
 ### Configuration
-- **`SLACK_WEBHOOK_URL`** (required): Your Slack Incoming Webhook URL
-- **`LOG_LEVEL`** (optional): Logging verbosity - `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`)
-- **`PORT`** (optional): External port to expose (default: `8080`)
-- **`VI_BATCH_WINDOW`** (optional): Video Intelligence detection batching window in seconds (default: `10`)
+
+**Required:**
+- **`SLACK_WEBHOOK_URL`**: Your Slack Incoming Webhook URL
+
+**Optional:**
+- **`LOG_LEVEL`**: Logging verbosity - `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`)
+- **`PORT`**: External port to expose (default: `8080`)
+
+**Video Intelligence Settings:**
+- **`VI_BATCH_WINDOW`**: Detection batching window in seconds (default: `10`)
   - Increase for less frequent AI detection summaries
   - Decrease for more real-time updates (may increase Slack message volume)
+- **`VI_MAX_BATCH_SIZE`**: Maximum detections per batch before early flush (default: `10000`)
+  - Prevents memory issues on high-volume streams
+  - Triggers automatic flush when exceeded
+- **`VI_TRACK_EXPIRY`**: Frames before object track expires (default: `30`)
+  - Lower for fast-moving objects, higher for slow scenes
+- **`VI_IOU_THRESHOLD`**: IoU threshold for object matching, 0.0-1.0 (default: `0.3`)
+  - Higher values = stricter matching (may split tracks)
+  - Lower values = looser matching (may merge tracks)
 
 ## Troubleshooting
 
